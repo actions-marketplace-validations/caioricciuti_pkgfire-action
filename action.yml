@@ -1,0 +1,112 @@
+name: PkgFire Dependency Firewall
+description: Block malicious and risky npm, PyPI, Go and Cargo dependencies before they reach your build.
+author: Caio Ricciuti
+
+branding:
+  icon: shield
+  color: orange
+
+inputs:
+  api-key:
+    description: PkgFire API key. Create one at https://pkgfire.org/api-keys and store it as a repository secret.
+    required: true
+  api-url:
+    description: PkgFire server. Change it only for a self-hosted PkgFire.
+    required: false
+    default: https://pkgfire.org
+  working-directory:
+    description: Directory to scan. Every lockfile below it is checked, each as its own target.
+    required: false
+    default: .
+  fail-on:
+    description: "Verdict that fails the job: block (default) or warn. A target that could not be checked always fails."
+    required: false
+    default: block
+  upload-sarif:
+    description: Upload findings to GitHub code scanning. Needs `security-events write` permission.
+    required: false
+    default: "true"
+  wait:
+    description: When coverage is partial, wait for the background re-check and report the complete result.
+    required: false
+    default: "false"
+
+outputs:
+  exit-code:
+    description: "0 allow, 1 warn, 2 block, 3 a target could not be checked."
+    value: ${{ steps.scan.outputs.exit-code }}
+  sarif-file:
+    description: Path to the SARIF report (empty when a target could not be checked).
+    value: ${{ steps.scan.outputs.sarif-file }}
+
+runs:
+  using: composite
+  steps:
+    # The installer verifies the binary against the published SHA256SUMS and
+    # refuses on a mismatch.
+    - name: Install the PkgFire CLI
+      shell: bash
+      env:
+        PKGFIRE_BASE_URL: ${{ inputs.api-url }}
+        PKGFIRE_INSTALL_DIR: ${{ runner.temp }}/pkgfire-bin
+      run: |
+        set -euo pipefail
+        mkdir -p "$PKGFIRE_INSTALL_DIR"
+        curl -fsSL "${PKGFIRE_BASE_URL%/}/install.sh" | sh
+        echo "$PKGFIRE_INSTALL_DIR" >> "$GITHUB_PATH"
+
+    # Reads the lockfiles already committed, without installing anything or
+    # running any package code. On Actions the CLI also annotates the lockfile
+    # lines a rule fired on and writes the job summary.
+    - name: Scan dependencies
+      id: scan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PKGFIRE_API_KEY: ${{ inputs.api-key }}
+        PKGFIRE_API_URL: ${{ inputs.api-url }}
+        PKGFIRE_NO_UPDATE_CHECK: "1"
+        INPUT_WAIT: ${{ inputs.wait }}
+      run: |
+        if [ -z "$PKGFIRE_API_KEY" ]; then
+          echo "::error title=PkgFire::No API key. Set the api-key input from a secret. Pull requests from forks do not receive secrets."
+          echo "exit-code=3" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        args=(scan --all --format sarif)
+        [ "$INPUT_WAIT" = "true" ] && args+=(--wait)
+        sarif="$RUNNER_TEMP/pkgfire.sarif"
+        set +e
+        pkgfire "${args[@]}" > "$sarif"
+        code=$?
+        set -e
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        # No SARIF on exit 3: uploading a partial report would close alerts
+        # nobody re-checked.
+        if [ "$code" -ne 3 ]; then
+          echo "sarif-file=$sarif" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Upload to code scanning
+      if: always() && inputs.upload-sarif == 'true' && steps.scan.outputs.sarif-file != ''
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ steps.scan.outputs.sarif-file }}
+        category: pkgfire
+
+    - name: Apply the verdict
+      if: always()
+      shell: bash
+      env:
+        CODE: ${{ steps.scan.outputs.exit-code }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        case "$FAIL_ON" in
+          block) threshold=2 ;;
+          warn)  threshold=1 ;;
+          *) echo "::error title=PkgFire::fail-on must be block or warn, got '$FAIL_ON'"; exit 3 ;;
+        esac
+        code="${CODE:-3}"
+        if [ "$code" -ge "$threshold" ]; then
+          exit "$code"
+        fi
